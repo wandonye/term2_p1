@@ -164,6 +164,40 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+bool checkCloseFront(double check_car_speed, double check_car_s, 
+						double prev_size, double car_speed, double car_s, double front_margin) {
+	check_car_s+=prev_size*0.02*check_car_speed;
+	if ((check_car_s>car_s)&&((check_car_s-car_s)<front_margin*car_speed/50)) {
+		return true;
+	}
+	return false;
+}
+
+bool checkSideCarSafe(double check_car_speed, double check_car_s, 
+						double prev_size, double car_speed, double car_s, double front_margin, double back_margin) {
+	check_car_s+=prev_size*0.02*check_car_speed;
+  double delta = check_car_s - car_s;
+  if ((delta<front_margin*car_speed/50) && (delta>-back_margin*check_car_speed/(car_speed+1))) {
+    // the car being checked is within a window of the current car
+    // the boundary of the window in the back depends on the relative speed of the two car
+    return false;
+  }
+	return true;
+}
+
+// All the possible states of the car
+enum carStates
+{
+    keepLane,
+    willChangeLeft,
+    willChangeRight,
+    isChangingLeft,
+    isChangingRight
+};
+
+// initiate car state as lane keeping
+carStates cur_state = carStates::keepLane;
+
 int main() {
   uWS::Hub h;
 
@@ -201,8 +235,8 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-	int lane = 1;
-  double ref_speed = 49.5;
+  int lane = 1;
+  double ref_speed = 0.0;
 
   h.onMessage([&lane,&ref_speed,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
@@ -224,124 +258,242 @@ int main() {
           // j[1] is the data JSON object
           
         	// Main car's localization Data
-          	double car_x = j[1]["x"];
-          	double car_y = j[1]["y"];
-          	double car_s = j[1]["s"];
-          	double car_d = j[1]["d"];
-          	double car_yaw = j[1]["yaw"];
-          	double car_speed = j[1]["speed"];
+          double car_x = j[1]["x"];
+          double car_y = j[1]["y"];
+          double car_s = j[1]["s"];
+          double car_d = j[1]["d"];
+          double car_yaw = j[1]["yaw"];
+          double car_speed = j[1]["speed"];
 
-          	// Previous path data given to the Planner
-          	auto previous_path_x = j[1]["previous_path_x"];
-          	auto previous_path_y = j[1]["previous_path_y"];
-          	// Previous path's end s and d values 
-          	double end_path_s = j[1]["end_path_s"];
-          	double end_path_d = j[1]["end_path_d"];
+          // Previous path data given to the Planner
+          auto previous_path_x = j[1]["previous_path_x"];
+          auto previous_path_y = j[1]["previous_path_y"];
+          // Previous path's end s and d values 
+          double end_path_s = j[1]["end_path_s"];
+          double end_path_d = j[1]["end_path_d"];
 
-          	// Sensor Fusion Data, a list of all other cars on the same side of the road.
-          	auto sensor_fusion = j[1]["sensor_fusion"];
+          // Sensor Fusion Data, a list of all other cars on the same side of the road.
+          auto sensor_fusion = j[1]["sensor_fusion"];
 
-          	json msgJson;
+          json msgJson;
 
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
+          vector<double> next_x_vals;
+          vector<double> next_y_vals;
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-						
-						vector<double> ptsx;
-          	vector<double> ptsy;
+          // TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+          int prev_size = previous_path_x.size();
+          // reuse previous plan
+          if(prev_size > 0) {
+            car_s = end_path_s;
+          }
 
-						// ref_x, ref_y: the starting point of the new calculation
-						double ref_x = car_x;
-						double ref_y = car_y;
-						double ref_yaw = deg2rad(car_yaw);
-						int prev_size = previous_path_x.size();
-						if (prev_size<2) {
-							double prev_car_x = car_x-cos(car_yaw);
-							double prev_car_y = car_y-sin(car_yaw);
+          // if there is a close car in front in the same lane
+          bool too_close_lane = false;
+          // if there is a close car in front in the left lane
+          bool is_ok_to_left = (car_d>4);
+          // if there is a close car in front in the right lane
+          bool is_ok_to_right = (car_d<8);
+                
+          // distance threshold for car in the same lane
+          double front_margin = 25.0;
+          // distance threshold for car in other lanes
+          double lane_change_front_margin = 25.0;
+          double lane_change_back_margin = 10.0;
 
-							ptsx.push_back(prev_car_x);
-							ptsx.push_back(car_x);
-							ptsy.push_back(prev_car_y);
-							ptsy.push_back(car_y);
-						} else {
-							ref_x = previous_path_x[prev_size-1];
-							ref_y = previous_path_y[prev_size-1];
+          // speed of the car within threshold (if any)
+          double front_car_speed = 100.0;
+          double left_car_speed = 100.0;
+          double right_car_speed = 100.0;
 
-							double ref_x_prev = previous_path_x[prev_size-2];
-							double ref_y_prev = previous_path_y[prev_size-2];
-							ref_yaw = atan2(ref_y-ref_y_prev,ref_x-ref_x_prev);
+          // sensor fusion
+          for (int i=0; i<sensor_fusion.size(); i++) {   // Evaluate each car
+            float d = sensor_fusion[i][6];
+            double vx = sensor_fusion[i][3];
+            double vy = sensor_fusion[i][4];
+            // car is in lane number=lane
+            double speed = sqrt(vx*vx+vy*vy);
 
-							ptsx.push_back(ref_x_prev);
-							ptsx.push_back(ref_x);
-							ptsy.push_back(ref_y_prev);
-							ptsy.push_back(ref_y);
-						}
+            if (d<(4*lane)) {
+              // sensed car is in the left lane
+              if (lane!=0) {
+                // no need to check left lane if it's already the leftmost
+                // cout<<"left lane:"<<sensor_fusion[i]<<endl;
+                if (!checkSideCarSafe(speed,sensor_fusion[i][5],
+                                prev_size, car_speed, car_s, lane_change_front_margin, lane_change_back_margin)) {
+                  left_car_speed = min(speed, left_car_speed);
+                  is_ok_to_left = false;
+                }
+              }
+            } else if (d<(4*lane+4)) {
+              // cout<<"current lane:"<<sensor_fusion[i]<<endl;
+              if (checkCloseFront(speed, sensor_fusion[i][5],
+                              prev_size, car_speed, car_s, front_margin)) {
+                front_car_speed = min(speed, front_car_speed);
+                too_close_lane = true;
+              }
+            } else if (d<(4*lane+8)) {
+              // cout<<"right lane:"<<sensor_fusion[i]<<endl;
+              if (!checkSideCarSafe(speed, sensor_fusion[i][5],
+                              prev_size, car_speed, car_s, lane_change_front_margin, lane_change_back_margin)) {
+                right_car_speed = min(speed, right_car_speed);
+                is_ok_to_right = false;
+              }
+            }
+          }
+          // cout<<"end of one scan"<<endl;
+          
+          // path anchor points
+          vector<double> ptsx;
+          vector<double> ptsy;
 
-						vector<double> next_wp0 = getXY(car_s+30,2+4*lane,map_waypoints_s,map_waypoints_x,map_waypoints_y);
-						vector<double> next_wp1 = getXY(car_s+60,2+4*lane,map_waypoints_s,map_waypoints_x,map_waypoints_y);
-						vector<double> next_wp2 = getXY(car_s+90,2+4*lane,map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          // ref_x, ref_y: the starting point of the new calculation
+          double ref_x = car_x;
+          double ref_y = car_y;
+          double rot = deg2rad(car_yaw);
+          if (prev_size<2) {
+            // when less the 2 points left
+            // use car's current location and one step backward as 
+            // two initial points for this round of calculation
+            double prev_car_x = car_x-cos(rot);
+            double prev_car_y = car_y-sin(rot);
 
-						ptsx.push_back(next_wp0[0]);
-						ptsx.push_back(next_wp1[0]);
-						ptsx.push_back(next_wp2[0]);
+            ptsx.push_back(prev_car_x);
+            ptsx.push_back(car_x);
+            ptsy.push_back(prev_car_y);
+            ptsy.push_back(car_y);
+          } else {
+            // otherwise, use last two points of the previous plan 
+            // as initial points
+            ref_x = previous_path_x[prev_size-1];
+            ref_y = previous_path_y[prev_size-1];
 
-						ptsy.push_back(next_wp0[1]);
-						ptsy.push_back(next_wp1[1]);
-						ptsy.push_back(next_wp2[1]);
+            double ref_x_prev = previous_path_x[prev_size-2];
+            double ref_y_prev = previous_path_y[prev_size-2];
+            rot = atan2(ref_y-ref_y_prev,ref_x-ref_x_prev);
 
-						for (int i=0; i<ptsx.size(); i++) {
-							double dx = ptsx[i]-ref_x;
-							double dy = ptsy[i]-ref_y;
-							
-							ptsx[i] = dx*cos(0-ref_yaw)-dy*sin(0-ref_yaw);
-							ptsy[i] = dx*sin(0-ref_yaw)+dy*cos(0-ref_yaw);
-						}
+            ptsx.push_back(ref_x_prev);
+            ptsx.push_back(ref_x);
+            ptsy.push_back(ref_y_prev);
+            ptsy.push_back(ref_y);
+          }
 
-						// create a spline
-						tk::spline s;
-						// set anchor points of the spline
-						s.set_points(ptsx,ptsy);
+          // State transition
+          switch (cur_state)
+          {
+            case carStates::keepLane:
+              // cout<<"keepLane"<<endl;
+              if (too_close_lane) {
+                if (is_ok_to_left&&is_ok_to_right) {
+                  // if both lane are available, choose the faster lane
+                  cur_state = (right_car_speed>left_car_speed)?carStates::willChangeRight:carStates::willChangeLeft;
+                } else if (is_ok_to_left) {
+                  // prepare left lane change
+                  cur_state = carStates::willChangeLeft;
+                } else if (is_ok_to_right) {
+                  // prepare right lane change
+                  cur_state = carStates::willChangeRight;
+                } else {
+                  if (ref_speed>front_car_speed) { ref_speed -= 0.224; }
+                }
+              } else if (ref_speed<49.75) {
+                ref_speed += 0.224;
+              }
+              break;
+            case carStates::willChangeLeft:
+              // cout<<"willChangeLeft"<<endl;
+              lane = lane - 1;
+              cur_state = carStates::isChangingLeft;
+              break;
+            case carStates::willChangeRight:
+              // cout<<"willChangeRight"<<endl;
+              lane = lane + 1;
+              cur_state = carStates::isChangingRight;
+              break;
+            case carStates::isChangingLeft:
+              // cout<<"isChangingLeft"<<endl;
+              if (car_d<(4*lane+4)&&car_d>4*lane) {
+                cur_state = carStates::keepLane;
+              }
+              break;
+            case carStates::isChangingRight:
+              // cout<<"isChangingRight"<<endl;
+              if (car_d<(4*lane+4)&&car_d>4*lane) {
+                cur_state = carStates::keepLane;
+              }
+              break;
+            default:
+              break;
+          }
 
-						for (int i = 0; i < previous_path_x.size(); i++)
-						{
-							next_x_vals.push_back(previous_path_x[i]);
-							next_y_vals.push_back(previous_path_y[i]);
-						}
+          vector<double> next_wp0 = getXY(car_s+30,2+4.0*lane,map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          vector<double> next_wp1 = getXY(car_s+60,2+4.0*lane,map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          vector<double> next_wp2 = getXY(car_s+90,2+4.0*lane,map_waypoints_s,map_waypoints_x,map_waypoints_y);
 
-						double target_x = 30.0;
-						double target_y = s(target_x);
+          ptsx.push_back(next_wp0[0]);
+          ptsx.push_back(next_wp1[0]);
+          ptsx.push_back(next_wp2[0]);
 
-						double target_dist = sqrt(target_x*target_x+target_y*target_y);
-						double x_add_on = 0;
+          ptsy.push_back(next_wp0[1]);
+          ptsy.push_back(next_wp1[1]);
+          ptsy.push_back(next_wp2[1]);
 
-						for(int i = 1; i < 50-prev_size; i++)
-						{
-							double N = target_dist/(0.02*ref_speed/2.24);
-							double x_pt = x_add_on+target_x/N;
-							double y_pt = s(x_pt);
-							x_add_on = x_pt;
+          for (int i=0; i<ptsx.size(); i++) {
+            double dx = ptsx[i]-ref_x;
+            double dy = ptsy[i]-ref_y;
+            
+            ptsx[i] = dx*cos(0-rot)-dy*sin(0-rot);
+            ptsy[i] = dx*sin(0-rot)+dy*cos(0-rot);
+          }
+          
+          // create a spline
+          tk::spline s;
+          // set anchor points of the spline
+          s.set_points(ptsx,ptsy);
+          // now think of s as the function for the path curve, 
+          // input x-coord, output y-coord
+          // shifted ref point to the origin, i.e. input 0, output 0
 
-							double x_bak = x_pt;
-							double y_bak = y_pt;
+          // use path points from previous iteration
+          for (int i = 0; i < previous_path_x.size(); i++)
+          {
+            next_x_vals.push_back(previous_path_x[i]);
+            next_y_vals.push_back(previous_path_y[i]);
+          }
 
-							x_pt = x_bak*cos(ref_yaw)-y_bak*sin(ref_yaw);
-							y_pt = x_bak*sin(ref_yaw)+y_bak*cos(ref_yaw);
+          double target_x = 30.0;
+          double target_y = s(target_x);
 
-							x_pt += ref_x;
-							y_pt += ref_y;
+          // Euclidean distance
+          double target_dist = sqrt(target_x*target_x+target_y*target_y);
+          double x_add_on = 0;
 
-							next_x_vals.push_back(x_pt);
-							next_y_vals.push_back(y_pt);
-						}
+          for(int i = 1; i < 50-prev_size; i++)
+          {
+            double N = target_dist/(0.02*ref_speed/2.24);
+            double x_pt = x_add_on+target_x/N;
+            double y_pt = s(x_pt);
+            x_add_on = x_pt;
 
-          	msgJson["next_x"] = next_x_vals;
-          	msgJson["next_y"] = next_y_vals;
+            double x_bak = x_pt;
+            double y_bak = y_pt;
 
-          	auto msg = "42[\"control\","+ msgJson.dump()+"]";
+            x_pt = x_bak*cos(rot)-y_bak*sin(rot);
+            y_pt = x_bak*sin(rot)+y_bak*cos(rot);
 
-          	//this_thread::sleep_for(chrono::milliseconds(1000));
-          	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+            x_pt += ref_x;
+            y_pt += ref_y;
+
+            next_x_vals.push_back(x_pt);
+            next_y_vals.push_back(y_pt);
+          }
+
+          msgJson["next_x"] = next_x_vals;
+          msgJson["next_y"] = next_y_vals;
+
+          auto msg = "42[\"control\","+ msgJson.dump()+"]";
+
+          //this_thread::sleep_for(chrono::milliseconds(1000));
+          ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
         }
       } else {
         // Manual driving
